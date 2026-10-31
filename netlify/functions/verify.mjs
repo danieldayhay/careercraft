@@ -57,3 +57,101 @@ async function checkWithGumroad(licenseKey, productId, increment) {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         product_id: productId,
+        license_key: licenseKey,
+        increment_uses_count: increment ? "true" : "false",
+      }),
+    });
+  } catch {
+    return { state: "error" };
+  }
+
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    /* not JSON */
+  }
+
+  if (res.status === 404 || (data && data.success === false)) return { state: "invalid" };
+  if (!res.ok || !data || data.success !== true) return { state: "error" };
+
+  const p = data.purchase || {};
+  const revoked =
+    p.refunded === true ||
+    p.chargebacked === true ||
+    (p.disputed === true && p.dispute_won !== true) ||
+    Boolean(p.subscription_cancelled_at) ||
+    Boolean(p.subscription_ended_at) ||
+    Boolean(p.subscription_failed_at);
+  if (revoked) return { state: "revoked" };
+
+  return { state: "valid", uses: Number(data.uses) || 0 };
+}
+
+export default async (req) => {
+  if (req.method !== "POST") return json({ ok: false, reason: "method" }, 405);
+
+  // Only accept requests from this same site.
+  const origin = req.headers.get("origin");
+  if (origin) {
+    try {
+      if (new URL(origin).host !== new URL(req.url).host) return json({ ok: false, reason: "origin" }, 403);
+    } catch {
+      return json({ ok: false, reason: "origin" }, 403);
+    }
+  }
+
+  const productId = process.env.GUMROAD_PRODUCT_ID;
+  const secret = process.env.TOKEN_SECRET;
+  if (!productId || !secret || secret.length < 32) {
+    console.error("verify: GUMROAD_PRODUCT_ID or TOKEN_SECRET is missing or too short");
+    return json({ ok: false, reason: "unavailable" }, 503);
+  }
+  const maxUses = num(process.env.MAX_USES, 5);
+  const recheckMs = num(process.env.RECHECK_HOURS, 24) * 60 * 60 * 1000;
+
+  let body;
+  try {
+    body = await req.json();
+  } catch {
+    return json({ ok: false, reason: "bad_request" }, 400);
+  }
+  const now = Date.now();
+
+  // ---- first-time unlock with a license key ----
+  if (body && body.action === "activate") {
+    const key = typeof body.license_key === "string" ? body.license_key.trim() : "";
+    if (key.length < 8 || key.length > 100) return json({ ok: false, reason: "invalid" });
+
+    const result = await checkWithGumroad(key, productId, true);
+    if (result.state === "error") return json({ ok: false, reason: "unavailable" }, 503);
+    if (result.state === "invalid") return json({ ok: false, reason: "invalid" });
+    if (result.state === "revoked") return json({ ok: false, reason: "revoked" });
+    if (maxUses > 0 && result.uses > maxUses) return json({ ok: false, reason: "limit" });
+
+    return json({ ok: true, token: seal({ k: key, v: now }, secret) });
+  }
+
+  // ---- returning customer with a saved token ----
+  if (body && body.action === "check") {
+    const payload = open(body.token, secret);
+    if (!payload || payload.v > now + 60_000 || now - payload.v > MAX_IDLE_MS) {
+      return json({ ok: false, reason: "invalid" });
+    }
+
+    // Recently verified: no need to ask Gumroad again.
+    if (now - payload.v < recheckMs) return json({ ok: true });
+
+    // Re-check with Gumroad so refunded or revoked purchases lose access.
+    const result = await checkWithGumroad(payload.k, productId, false);
+    if (result.state === "error") return json({ ok: false, reason: "unavailable" }, 503);
+    if (result.state === "invalid") return json({ ok: false, reason: "invalid" });
+    if (result.state === "revoked") return json({ ok: false, reason: "revoked" });
+
+    return json({ ok: true, token: seal({ k: payload.k, v: now }, secret) });
+  }
+
+  return json({ ok: false, reason: "bad_request" }, 400);
+};
+
+export const config = { path: "/api/verify" };
